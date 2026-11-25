@@ -1,0 +1,501 @@
+diff --git a/kernels/prefill_sp.py b/kernels/prefill_sp.py
+index 18ee908..97c7358 100644
+--- a/kernels/prefill_sp.py
++++ b/kernels/prefill_sp.py
+@@ -214,6 +214,9 @@ def _norm2(h, blk, pid, rreg, HT, S, W, TS, HC, ra, w2, onesb, xb, x2g, rg):
+     ncc.all_gather(srcs=[xb[blk]], dsts=[x2g[blk]], replica_group=rg, collective_dim=0)
+ 
+ 
++SKVF = [0]
++
++
+ def _qkv_post(l, nt, blk, t0, ps, TB, NQL, NKL, D, pid, onesb, qnc, knc, rot_sb, cs, sn, ident, s_q, s_k, s_v,
+               kcache, vcache, VPERM, SPH, aq0, ak0, av0):
+     """q / k norm + RoPE + cache writes of QKV tile nt (ps), or the V transpose + cache writes"""
+@@ -245,8 +248,13 @@ def _qkv_post(l, nt, blk, t0, ps, TB, NQL, NKL, D, pid, onesb, qnc, knc, rot_sb,
+                 _hd(aq0[pid * NQL + nt, :, nl.ds(t0, TB)], ro)
+         else:
+             j = nt - NQL
+-            _hd(s_k[pid * NKL + j, :, nl.ds(t0, TB)], ro)
+-            _hd(kcache[l, pid, j, :, nl.ds(t0, TB)], ro)
++            if SKVF[0]:
++                for c in range(2):
++                    _hd(s_k[c * NKL + j, :, nl.ds(t0, TB)], ro)
++                    _hd(kcache[l, c, j, :, nl.ds(t0, TB)], ro)
++            else:
++                _hd(s_k[pid * NKL + j, :, nl.ds(t0, TB)], ro)
++                _hd(kcache[l, pid, j, :, nl.ds(t0, TB)], ro)
+             if blk < SPH:
+                 _hd(ak0[pid * NKL + j, :, nl.ds(t0, TB)], ro)
+     else:
+@@ -258,17 +266,21 @@ def _qkv_post(l, nt, blk, t0, ps, TB, NQL, NKL, D, pid, onesb, qnc, knc, rot_sb,
+             tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
+             nisa.nc_matmul(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
+             nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
++        cl = [pid]
++        if SKVF[0]:
++            cl = [0, 1]
+         for tb in range(TB // 128):
+-            _hd(s_v[pid * NKL + j, nl.ds(t0 + tb * 128, 128), :], vr[:, tb, :])
+             if blk < SPH:
+                 _hd(av0[pid * NKL + j, nl.ds(t0 + tb * 128, 128), :], vr[:, tb, :])
+-            if VPERM:
+-                VJ = vcache.shape[2] // 128
+-                NKD = vcache.shape[3]
+-                _hd(vcache[l, pid].ap(pattern=[[VJ * NKD, 128], [1, D]],
+-                                      offset=((t0 + tb * 128) // 128) * NKD + j * D), vr[:, tb, :])
+-            else:
+-                _hd(vcache[0, pid, nl.ds(t0 + tb * 128, 128), j * D:(j + 1) * D], vr[:, tb, :])
++            for c in cl:
++                _hd(s_v[c * NKL + j, nl.ds(t0 + tb * 128, 128), :], vr[:, tb, :])
++                if VPERM:
++                    VJ = vcache.shape[2] // 128
++                    NKD = vcache.shape[3]
++                    _hd(vcache[l, c].ap(pattern=[[VJ * NKD, 128], [1, D]],
++                                        offset=((t0 + tb * 128) // 128) * NKD + j * D), vr[:, tb, :])
++                else:
++                    _hd(vcache[0, c, nl.ds(t0 + tb * 128, 128), j * D:(j + 1) * D], vr[:, tb, :])
+ 
+ 
+ def _pre_gu(wgu_l, n, ITL, HT):
+@@ -378,8 +390,9 @@ def _spbuf(shape, dt, name):
+ 
+ 
+ def layer_sp(h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vcache, s_q, s_k, s_v, s_o,
+-             NQL, NKL, ITL, W, rg, onesb, ident, VPERM, LAG=-1, PN=0, TLG=0, SPO=0, SPA=0, LPN=1, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0):
++             NQL, NKL, ITL, W, rg, onesb, ident, VPERM, LAG=-1, PN=0, TLG=0, SPO=0, SPA=0, LPN=1, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0, SKV=0):
+     SPSN[0] = SPS
++    SKVF[0] = SKV
+     MPK[0] = MP
+     assert not (MP and KTP)
+     GCHK[0] = GCH
+@@ -522,7 +535,17 @@ def layer_sp(h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vc
+                         for kt in range(g * HPq, (g + 1) * HPq):
+                             nisa.nc_matmul(dst=kq[nt][1], stationary=kq[nt][0][:, kt * 128:(kt + 1) * 128],
+                                            moving=x1[:, :, kt * HC:(kt + 1) * HC])
++            nts = []
+             for nt in range(NQKV):
++                nts.append(nt)
++            if SKV:   # round 010 (SKV): core 0 projects the rank's k, core 1 its v (the kv head is replicated on both
++                # cores); each writes both cores' copies. Bitwise identical, 1 of 6 QKV tiles less per core
++                assert NKL == 1 and KTQ == 0
++                nts = []
++                for nt in range(NQL):
++                    nts.append(nt)
++                nts.append(NQL + pid)
++            for nt in nts:
+                 if nt < KTQ:
+                     ps = kq[nt][1]
+                 else:
+diff --git a/kernels/prefill_tp.py b/kernels/prefill_tp.py
+index 421aadb..a98417c 100644
+--- a/kernels/prefill_tp.py
++++ b/kernels/prefill_tp.py
+@@ -40,8 +40,15 @@ def _hs1(dst, src):
+         _hd(dst, src)
+ 
+ 
++WQ = [0]   # round 010 experiment: queue of the _hs2 DMAs (phase-A q/k/v + cache writes, s_o reads): 1 Scalar hwdge, 2 GpSimd swdge
++
++
+ def _hs2(dst, src):
+-    if SQ[0] >= 2:
++    if WQ[0] == 1:
++        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar)
++    elif WQ[0] == 2:
++        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.swdge)
++    elif SQ[0] >= 2:
+         nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.none)
+     else:
+         _hd(dst, src)
+@@ -337,20 +344,31 @@ def _finish_norm(h, pid, t0, n, HT, src, ch, CCBF, w_sb, onesb, xo, NSUB):
+ HSCH = [1]   # HS: hidden-tile chunks of the residual add / square / sum of squares (pipelined; same per-element ops)
+ 
+ 
+-def _norm_sb(hs, t0, n, w_sb, onesb, HT, xo, xo0):
++DRS = [0]     # round 010 (DR): deferred rstd -- the norms emit x = bf16(h * w) right away, the per-token rstd is applied
++DRE = [nisa.engine.vector]
++DRR = [None]  # to the outputs of the matmuls that read x (v, gate, up); the q / k head norms cancel it. Not bitwise.
++
++
++def _norm_sb(hs, t0, n, w_sb, onesb, HT, xo, xo0, dr=0):
+     """HS (round 006): _norm_blk with h already in SBUF (hs [128, HT, S] fp32): the same instructions minus the load
+-    (the square in HSCH[0] chunks of hidden tiles, the sum-of-squares matmuls in the same kt order)"""
++    (the square in HSCH[0] chunks of hidden tiles, the sum-of-squares matmuls in the same kt order).
++    dr (round 010, DR): xo = bf16(h * w) per chunk, returns rstd [128, n] (the same on every partition)"""
+     sq = nl.ndarray((128, HT, n), dtype=nl.bfloat16, buffer=nl.sbuf)
+     ss = nl.ndarray((128, n), dtype=nl.float32, buffer=nl.psum)
+     NC = HSCH[0]
+     CT = HT // NC
+     for c in range(NC):
++        if dr:
++            nisa.tensor_tensor(dst=xo[:, c * CT:(c + 1) * CT, xo0:xo0 + n], data1=hs[:, c * CT:(c + 1) * CT, t0:t0 + n],
++                               data2=w_sb.ap(pattern=[[HT, 128], [1, CT], [0, n]], offset=c * CT), op=nl.multiply)
+         nisa.activation(dst=sq[:, c * CT:(c + 1) * CT, :], op=nl.square, data=hs[:, c * CT:(c + 1) * CT, t0:t0 + n])
+         for kt in range(c * CT, (c + 1) * CT):
+             nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq[:, kt, :])
+     rstd = nl.ndarray((128, n), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_scalar(dst=rstd, data=ss, op0=nl.multiply, operand0=1.0 / (HT * 128), op1=nl.add, operand1=EPS)
+     nisa.tensor_scalar(dst=rstd, data=rstd, op0=nl.rsqrt, operand0=0.0, engine=nisa.engine.gpsimd)
++    if dr:
++        return rstd
+     for kt in range(HT):
+         nisa.scalar_tensor_tensor(dst=xo[:, kt, xo0:xo0 + n], data=hs[:, kt, t0:t0 + n], op0=nl.multiply,
+                                   operand0=w_sb[:, kt:kt + 1], op1=nl.multiply, operand1=rstd)
+@@ -434,9 +452,73 @@ def _combine_finish(h, pid, HT, pend):
+         _hd(h[:, nl.ds(pid * HH, HH), nl.ds(u0, NC)], a)
+ 
+ 
++def _tp_post(nt, ps, l, pid, t0, TB, NQL, NKL, KVS, qnc, knc, onesb, rot_sb, cs, sn, ident, s_q, s_k, s_v, kcache, vcache):
++    """round 010: QKV tile post-processing of prefill_tp phase A (q / k norm + RoPE + cache writes, v transpose)"""
++    if nt < NQL + NKL:
++        sq = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.activation(dst=sq, op=nl.square, data=ps)
++        ss = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq)
++        rs = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(dst=rs, data=ss, op0=nl.multiply, operand0=1.0 / D, op1=nl.add, operand1=EPS)
++        nisa.tensor_scalar(dst=rs, data=rs, op0=nl.rsqrt, operand0=0.0, engine=nisa.engine.gpsimd)
++        yb = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
++        if nt < NQL:
++            nisa.scalar_tensor_tensor(dst=yb, data=ps, op0=nl.multiply, operand0=qnc, op1=nl.multiply, operand1=rs)
++        else:
++            nisa.scalar_tensor_tensor(dst=yb, data=ps, op0=nl.multiply, operand0=knc, op1=nl.multiply, operand1=rs)
++        rp = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=rp, stationary=rot_sb, moving=yb)
++        xc = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=xc, data1=yb, data2=cs, op=nl.multiply)
++        xs = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=xs, data1=rp, data2=sn, op=nl.multiply)
++        ro = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=ro, data1=xc, data2=xs, op=nl.add, engine=nisa.engine.gpsimd)
++        if nt < NQL:
++            _hs2(s_q[pid * NQL + nt, :, nl.ds(t0, TB)], ro)
++        else:
++            j = nt - NQL
++            if KVS:
++                for c in range(2):
++                    _hs2(s_k[c * NKL + j, :, nl.ds(t0, TB)], ro)
++                    _hs2(kcache[l, c, j, :, nl.ds(t0, TB)], ro)
++            else:
++                _hs2(s_k[pid * NKL + j, :, nl.ds(t0, TB)], ro)
++                _hs2(kcache[l, pid, j, :, nl.ds(t0, TB)], ro)
++    else:
++        j = nt - NQL - NKL
++        vb = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
++        if DRR[0] is not None:   # DR: x1 was not scaled by rstd; v is linear in it (q / k: their own norm cancels it)
++            nisa.tensor_tensor(dst=vb, data1=ps, data2=DRR[0], op=nl.multiply)
++        else:
++            nisa.activation(dst=vb, op=nl.copy, data=ps)
++        vr = nl.ndarray((128, TB // 128, D), dtype=nl.bfloat16, buffer=nl.sbuf)
++        for tb in range(TB // 128):
++            tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
++            nisa.nc_matmul(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
++            nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
++        cl = [pid]
++        if KVS:
++            cl = [0, 1]
++        for tb in range(TB // 128):
++            for c in cl:
++                _hs2(s_v[c * NKL + j, nl.ds(t0 + tb * 128, 128), :], vr[:, tb, :])
++                if VPERM:
++                    VJ = vcache.shape[2] // 128
++                    NKD = vcache.shape[3]
++                    _hs2(vcache[l, c].ap(pattern=[[VJ * NKD, 128], [1, D]],
++                                        offset=((t0 + tb * 128) // 128) * NKD + j * D), vr[:, tb, :])
++                else:
++                    _hs2(vcache[l, c, nl.ds(t0 + tb * 128, 128), j * D:(j + 1) * D], vr[:, tb, :])
++
++
+ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache,
+-        rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL=0, TEB=256, CCN=128, CCBF=0, CCHBM=0, NSP=0, SB=0, KVS=0, LPN=1, PFG=0, PFQ=0, FN=0, PMF=0, HALF=0, SQL=0, ILV=0, QW=0, QNS=0, AQL=0, NSP2=0, PN=0, PNA=0, XN=0, FN0=0, HS=0, HSC=1, NCH=1, NCQL=0, NCH2=0, SP=0, SPL=-1, SPN=0, SPT=0, SPO=0, SPA=0, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0):
++        rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL=0, TEB=256, CCN=128, CCBF=0, CCHBM=0, NSP=0, SB=0, KVS=0, LPN=1, PFG=0, PFQ=0, FN=0, PMF=0, HALF=0, SQL=0, ILV=0, QW=0, QNS=0, AQL=0, NSP2=0, PN=0, PNA=0, XN=0, FN0=0, HS=0, HSC=1, NCH=1, NCQL=0, NCH2=0, SP=0, SPL=-1, SPN=0, SPT=0, SPO=0, SPA=0, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0, QPD=0, DR=0, DRG=0, WQS=0):
+     NCQ[0] = NCQL
++    WQ[0] = WQS
++    DRR[0] = None
++    DRE[0] = nisa.engine.gpsimd if DRG else nisa.engine.vector
+     SQ[0] = SQL
+     HSCH[0] = HSC
+     NCHK[0] = NCH
+@@ -489,7 +571,7 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+     if STAGE == 2 and SP:   # round 007: sequence-parallel residual (prefill_sp.py)
+         assert S % 512 == 0
+         layer_sp(h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vcache, s_q, s_k, s_v, s_o,
+-                 NQL, NKL, ITL, W, rg, onesb, ident, VPERM, SPL, SPN, SPT, SPO, SPA, LPN, SPD, SPH, SPHN, SPP, SPQ, GCH, SOC, SPS, SPG, KTP, KTQ, MP)
++                 NQL, NKL, ITL, W, rg, onesb, ident, VPERM, SPL, SPN, SPT, SPO, SPA, LPN, SPD, SPH, SPHN, SPP, SPQ, GCH, SOC, SPS, SPG, KTP, KTQ, MP, KVS)
+         nisa.dma_copy(dst=pos_out, src=pl_sb)
+         return pos_out
+ 
+@@ -566,8 +648,13 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+                     _hs2(x1, x1x[:, :, nl.ds(t0, TB)])
+                 elif hs is not None:
+                     x1 = nl.ndarray((128, HT, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                    for sb in range(TB // NSA):
+-                        _norm_sb(hs, t0 + sb * NSA, NSA, w1, onesb, HT, x1, sb * NSA)
++                    DRR[0] = None
++                    if DR:
++                        assert NSA == TB
++                        DRR[0] = _norm_sb(hs, t0, NSA, w1, onesb, HT, x1, 0, 1)
++                    else:
++                        for sb in range(TB // NSA):
++                            _norm_sb(hs, t0 + sb * NSA, NSA, w1, onesb, HT, x1, sb * NSA)
+                 else:
+                     x1 = nl.ndarray((128, HT, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+                     for sb in range(TB // NSA):
+@@ -599,6 +686,7 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+                     for nt in range(NQL):
+                         nts.append(nt)
+                     nts.append(NQL + pid)
++                prv = None
+                 for qi_ in range(len(nts)):
+                     nt = nts[qi_]
+                     if xq is not None and xq == 0 and qi_ == len(nts) // 3:
+@@ -624,60 +712,15 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+                     ps = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.psum)
+                     for kt in range(HT):
+                         nisa.nc_matmul(dst=ps, stationary=wt[:, kt * 128:(kt + 1) * 128], moving=x1[:, kt, :])
+-                    if nt < NQL + NKL:
+-                        sq = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                        nisa.activation(dst=sq, op=nl.square, data=ps)
+-                        ss = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq)
+-                        rs = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
+-                        nisa.tensor_scalar(dst=rs, data=ss, op0=nl.multiply, operand0=1.0 / D, op1=nl.add, operand1=EPS)
+-                        nisa.tensor_scalar(dst=rs, data=rs, op0=nl.rsqrt, operand0=0.0, engine=nisa.engine.gpsimd)
+-                        yb = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                        if nt < NQL:
+-                            nisa.scalar_tensor_tensor(dst=yb, data=ps, op0=nl.multiply, operand0=qnc, op1=nl.multiply, operand1=rs)
+-                        else:
+-                            nisa.scalar_tensor_tensor(dst=yb, data=ps, op0=nl.multiply, operand0=knc, op1=nl.multiply, operand1=rs)
+-                        rp = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=rp, stationary=rot_sb, moving=yb)
+-                        xc = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
+-                        nisa.tensor_tensor(dst=xc, data1=yb, data2=cs, op=nl.multiply)
+-                        xs = nl.ndarray((128, TB), dtype=nl.float32, buffer=nl.sbuf)
+-                        nisa.tensor_tensor(dst=xs, data1=rp, data2=sn, op=nl.multiply)
+-                        ro = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                        nisa.tensor_tensor(dst=ro, data1=xc, data2=xs, op=nl.add, engine=nisa.engine.gpsimd)
+-                        if nt < NQL:
+-                            _hs2(s_q[pid * NQL + nt, :, nl.ds(t0, TB)], ro)
+-                        else:
+-                            j = nt - NQL
+-                            if KVS:
+-                                for c in range(2):
+-                                    _hs2(s_k[c * NKL + j, :, nl.ds(t0, TB)], ro)
+-                                    _hs2(kcache[l, c, j, :, nl.ds(t0, TB)], ro)
+-                            else:
+-                                _hs2(s_k[pid * NKL + j, :, nl.ds(t0, TB)], ro)
+-                                _hs2(kcache[l, pid, j, :, nl.ds(t0, TB)], ro)
++                    if QPD:   # round 010 (QPD): tile nt's post-processing after the next tile's matmuls (the in-order
++                        # TensorE does not wait for its norm / rsqrt / RoPE chain); bitwise identical
++                        if prv is not None:
++                            _tp_post(prv[0], prv[1], l, pid, t0, TB, NQL, NKL, KVS, qnc, knc, onesb, rot_sb, cs, sn, ident, s_q, s_k, s_v, kcache, vcache)
++                        prv = (nt, ps)
+                     else:
+-                        j = nt - NQL - NKL
+-                        vb = nl.ndarray((128, TB), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                        nisa.activation(dst=vb, op=nl.copy, data=ps)
+-                        vr = nl.ndarray((128, TB // 128, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                        for tb in range(TB // 128):
+-                            tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
+-                            nisa.nc_matmul(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
+-                            nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
+-                        cl = [pid]
+-                        if KVS:
+-                            cl = [0, 1]
+-                        for tb in range(TB // 128):
+-                            for c in cl:
+-                                _hs2(s_v[c * NKL + j, nl.ds(t0 + tb * 128, 128), :], vr[:, tb, :])
+-                                if VPERM:
+-                                    VJ = vcache.shape[2] // 128
+-                                    NKD = vcache.shape[3]
+-                                    _hs2(vcache[l, c].ap(pattern=[[VJ * NKD, 128], [1, D]],
+-                                                        offset=((t0 + tb * 128) // 128) * NKD + j * D), vr[:, tb, :])
+-                                else:
+-                                    _hs2(vcache[l, c, nl.ds(t0 + tb * 128, 128), j * D:(j + 1) * D], vr[:, tb, :])
++                        _tp_post(nt, ps, l, pid, t0, TB, NQL, NKL, KVS, qnc, knc, onesb, rot_sb, cs, sn, ident, s_q, s_k, s_v, kcache, vcache)
++                if prv is not None:
++                    _tp_post(prv[0], prv[1], l, pid, t0, TB, NQL, NKL, KVS, qnc, knc, onesb, rot_sb, cs, sn, ident, s_q, s_k, s_v, kcache, vcache)
+                 assert pa_q is None or pa_q == NPA
+                 assert xq is None or xq == 2
+             nisa.core_barrier(data=s_q, cores=(0, 1))
+@@ -821,8 +864,12 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+                         nx2 = None
+                     elif hs is not None:   # HS: attention all-reduce added to the SBUF residual, norm2 from there
+                         _sb_add(hs, t0, TE, HT, pend_a[blk], blk, CCBF, NSUB)
+-                        for sb in range(TE // NSUB):
+-                            _norm_sb(hs, t0 + sb * NSUB, NSUB, w2, onesb, HT, x2, sb * NSUB)
++                        if DR:
++                            assert NSUB == TE
++                            r2 = _norm_sb(hs, t0, NSUB, w2, onesb, HT, x2, 0, 1)
++                        else:
++                            for sb in range(TE // NSUB):
++                                _norm_sb(hs, t0 + sb * NSUB, NSUB, w2, onesb, HT, x2, sb * NSUB)
+                     elif LATE and (FN or (FN0 and blk == 0)):   # fused finish + norm2 of this block (round 004;
+                         # FN0, round 005: the first MLP block only)
+                         _finish_norm(h, pid, t0, TE, HT, pend_a[blk], blk, CCBF, w2, onesb, x2, NSUB)
+@@ -881,8 +928,16 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+                         for kt in range(HT):
+                             nisa.nc_matmul(dst=pu, stationary=wu[:, kt * 128:(kt + 1) * 128], moving=x2[:, kt, :])
+                         sg = nl.ndarray((128, TE), dtype=nl.float32, buffer=nl.sbuf)
+-                        nisa.activation(dst=sg, op=nl.silu, data=pg)
+-                        nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
++                        if DR and hs is not None:   # round 010 (DR): x2 = bf16(h * w), the per-token rstd applied here
++                            gs = nl.ndarray((128, TE), dtype=nl.float32, buffer=nl.sbuf)
++                            nisa.tensor_tensor(dst=gs, data1=pg, data2=r2, op=nl.multiply)
++                            nisa.activation(dst=sg, op=nl.silu, data=gs)
++                            us = nl.ndarray((128, TE), dtype=nl.float32, buffer=nl.sbuf)
++                            nisa.tensor_tensor(dst=us, data1=pu, data2=r2, op=nl.multiply, engine=DRE[0])
++                            nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=us, op=nl.multiply)
++                        else:
++                            nisa.activation(dst=sg, op=nl.silu, data=pg)
++                            nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
+                     if MP:   # packed slab: psum rows 0-63 = this core's gate half, 64-127 its up half
+                         wp = _slab(wgu[l, pid], 2 * NFU, HT)
+                         pp = nl.ndarray((128, TE), dtype=nl.float32, buffer=nl.psum)
+@@ -1063,9 +1118,9 @@ def _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm,
+ 
+ @nki.jit
+ def prefill_tp(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, wgp, wdp, normf, wlm, rot, cosT, sinT, kcache, vcache,
+-               rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL=0, TEB=256, CCN=128, CCBF=0, CCHBM=0, NSP=0, SB=0, KVS=0, LPN=1, PFG=0, PFQ=0, FN=0, PMF=0, HALF=0, SQL=0, ILV=0, QW=0, QNS=0, AQL=0, NSP2=0, PN=0, PNA=0, XN=0, FN0=0, HS=0, HSC=1, NCH=1, NCQL=0, NCH2=0, SP=0, SPL=-1, SPN=0, SPT=0, SPO=0, SPA=0, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0):
++               rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL=0, TEB=256, CCN=128, CCBF=0, CCHBM=0, NSP=0, SB=0, KVS=0, LPN=1, PFG=0, PFQ=0, FN=0, PMF=0, HALF=0, SQL=0, ILV=0, QW=0, QNS=0, AQL=0, NSP2=0, PN=0, PNA=0, XN=0, FN0=0, HS=0, HSC=1, NCH=1, NCQL=0, NCH2=0, SP=0, SPL=-1, SPN=0, SPT=0, SPO=0, SPA=0, SPD=0, SPH=0, SPHN=0, SPP=0, SPQ=0, GCH=1, SOC=1, SPS=1, SPG=0, KTP=0, KTQ=0, MP=0, QPD=0, DR=0, DRG=0, WQS=0):
+     if MP:   # round 009: the SP path reads the unpadded prefill MLP copies
+         wgu = wgp
+         wd = wdp
+     return _pg(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache,
+-               rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL, TEB, CCN, CCBF, CCHBM, NSP, SB, KVS, LPN, PFG, PFQ, FN, PMF, HALF, SQL, ILV, QW, QNS, AQL, NSP2, PN, PNA, XN, FN0, HS, HSC, NCH, NCQL, NCH2, SP, SPL, SPN, SPT, SPO, SPA, SPD, SPH, SPHN, SPP, SPQ, GCH, SOC, SPS, SPG, KTP, KTQ, MP)
++               rkb, s_h, s_q, s_k, s_v, s_o, s_p, STAGE, NQL, NKL, ITL, W, rg, OVL, TEB, CCN, CCBF, CCHBM, NSP, SB, KVS, LPN, PFG, PFQ, FN, PMF, HALF, SQL, ILV, QW, QNS, AQL, NSP2, PN, PNA, XN, FN0, HS, HSC, NCH, NCQL, NCH2, SP, SPL, SPN, SPT, SPO, SPA, SPD, SPH, SPHN, SPP, SPQ, GCH, SOC, SPS, SPG, KTP, KTQ, MP, QPD, DR, DRG, WQS)
+diff --git a/kernels/step_tp.py b/kernels/step_tp.py
+index 86e85d8..8408a87 100644
+--- a/kernels/step_tp.py
++++ b/kernels/step_tp.py
+@@ -309,6 +309,8 @@ def _xchg_add_tp_hbm(part, pid, rg, W, hb, hr, CCQ=0, RBQ=0, copied=False):
+     s = nl.ndarray((128, n), dtype=nl.float32, buffer=nl.sbuf)
+     if RBQ == 2:
+         nisa.dma_copy(dst=s, src=hr, dge_mode=nisa.dge_mode.none)
++    elif RBQ == 7:   # round 010: read-back on GpSimd's software DGE (the Sync queue keeps issuing weight DMAs)
++        nisa.dma_copy(dst=s, src=hr, dge_mode=nisa.dge_mode.swdge)
+     elif RBQ >= 3:
+         _dq(s, hr, RBQ)
+     else:
+@@ -316,14 +318,37 @@ def _xchg_add_tp_hbm(part, pid, rg, W, hb, hr, CCQ=0, RBQ=0, copied=False):
+     return s
+ 
+ 
++def _nxt_pf(l, pid, wqkv, wo, wgu, HT, NQL, SL, SLO, hw, qi, PF, PFO, PFN, KVS, qbuf, ring):
++    """the next layer's prefetches (QKV, PFO o_proj, PFN gate/up slabs), issued after (or, PFE, inside) the down GEMV"""
++    nxt = None
++    if PF > 0 and l + 1 < wqkv.shape[0] and ring is None:   # next layer's QKV slabs stream in during the down all-reduce
++        if KVS:
++            nxt, qi = _qkv_slabs(wqkv[l + 1, pid], HT, NQL, pid, SL, hw, qi)
++        elif qbuf is not None:
++            nxt, qi = _prefetch_into(wqkv[l + 1, pid], HT, SL, qbuf[(l + 1) % len(qbuf)], hw, qi)
++        else:
++            nxt, qi = _prefetch(wqkv[l + 1, pid], HT, SL, PF, hw, qi)
++        if PFO > 0:   # and the next layer's first PFO o_proj slabs (round 004)
++            po_, qi = _prefetch(wo[l + 1, pid], NQL, SLO if SLO > 0 else SL, PFO, hw, qi)
++            nxt = (nxt, po_)
++            if PFN > 0:   # round 010 (PFN): + the next layer's first PFN gate/up slabs (weights to stream during the
++                # down all-reduce chain, where the Sync queue waits on the read-back)
++                gn_, qi = _prefetch(wgu[l + 1, pid], HT, SL, PFN, hw, qi)
++                nxt = (nxt[0], po_, gn_)
++    return nxt, qi
++
++
+ def _layer_tp(h, l, pid, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot_sb, kcache, vcache,
+               preg, pb, cs_col, sn_col, ones, ident, idf, ones16, TB, SL, hw, HT, NQL, NKL, ITL, rg, W, PF=0, pre_qkv=None, hbuf=None,
+-              vreg=None, VCH=1, PFG=-1, CCQ=0, KVS=0, qbuf=None, HALF=0, RBQ=0, KVQ=0, PFO=0, SLO=0, CCQM=-1, RBQM=-1, ring=None, BCP=0):
++              vreg=None, VCH=1, PFG=-1, CCQ=0, KVS=0, qbuf=None, HALF=0, RBQ=0, KVQ=0, PFO=0, SLO=0, CCQM=-1, RBQM=-1, ring=None, BCP=0, PFN=0, PFE=0):
+     HID = HT * 128
+     G = NQL // NKL
+     pre_o = None
++    pre_gn = []
+     if isinstance(pre_qkv, tuple):   # PFO: (next-layer QKV slabs, next-layer o_proj slabs) from the previous layer
+         pre_o = pre_qkv[1]
++        if len(pre_qkv) > 2:   # PFN (round 010): + its first gate/up slabs
++            pre_gn = pre_qkv[2]
+         pre_qkv = pre_qkv[0]
+     TMAX = vcache.shape[2]
+     NT = TB // 128
+@@ -508,7 +533,15 @@ def _layer_tp(h, l, pid, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot_sb, kcache, vc
+             wt, qi = _gu_half_load(wgu[l, pid], HT, gsl[i], hw, qi)
+             pre_gu.append(wt)
+     elif PFG > 0 and ring is None:   # gate/up slabs stream in during attention, o_proj and its all-reduce
+-        pre_gu, qi = _prefetch(wgu[l, pid], HT, SL, PFG, hw, qi)
++        if len(pre_gn) > 0:
++            pre_gu = pre_gn
++            for i in range(len(pre_gn), PFG):
++                wt = nl.ndarray((128, SL * HT * 128), dtype=wgu.dtype, buffer=nl.sbuf)
++                _dma(wt, wgu[l, pid][:, i * SL * HT * 128:(i + 1) * SL * HT * 128], qi, hw)
++                qi += 1
++                pre_gu.append(wt)
++        else:
++            pre_gu, qi = _prefetch(wgu[l, pid], HT, SL, PFG, hw, qi)
+     if hbuf == "sbar":
+         y = _xchg_add_sbar(y_ps, pid, rg, W)
+     elif hbuf is None:
+@@ -570,19 +603,14 @@ def _layer_tp(h, l, pid, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot_sb, kcache, vc
+             dsb = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+             qi = _gemv(act, wd[l, pid], ITL, 0, HT, d_ps, 0, SL, hw, qi, dsb)
+             d_ps = dsb
++        elif PFE > 0:   # round 010 (PFE): the next layer's prefetches issued after the first PFE down tiles
++            qi = _gemv(act, wd[l, pid], ITL, 0, PFE, d_ps, 0, SL, hw, qi)
++            nxt, qi = _nxt_pf(l, pid, wqkv, wo, wgu, HT, NQL, SL, SLO, hw, qi, PF, PFO, PFN, KVS, qbuf, ring)
++            qi = _gemv(act, wd[l, pid], ITL, PFE, HT, d_ps, PFE, SL, hw, qi)
+         else:
+             qi = _gemv(act, wd[l, pid], ITL, 0, HT, d_ps, 0, SL, hw, qi)
+-    nxt = None
+-    if PF > 0 and l + 1 < wqkv.shape[0] and ring is None:   # next layer's QKV slabs stream in during the down all-reduce
+-        if KVS:
+-            nxt, qi = _qkv_slabs(wqkv[l + 1, pid], HT, NQL, pid, SL, hw, qi)
+-        elif qbuf is not None:
+-            nxt, qi = _prefetch_into(wqkv[l + 1, pid], HT, SL, qbuf[(l + 1) % len(qbuf)], hw, qi)
+-        else:
+-            nxt, qi = _prefetch(wqkv[l + 1, pid], HT, SL, PF, hw, qi)
+-        if PFO > 0:   # and the next layer's first PFO o_proj slabs (round 004)
+-            po_, qi = _prefetch(wo[l + 1, pid], NQL, SLO if SLO > 0 else SL, PFO, hw, qi)
+-            nxt = (nxt, po_)
++    if PFE == 0:
++        nxt, qi = _nxt_pf(l, pid, wqkv, wo, wgu, HT, NQL, SL, SLO, hw, qi, PF, PFO, PFN, KVS, qbuf, ring)
+     if hbuf == "sbar":
+         d = _xchg_add_sbar(d_ps, pid, rg, W)
+     elif hbuf is None:
+@@ -699,7 +727,7 @@ def _lm_argmax_tp(xf, wlm_c, pid, rkb, SL, hw, HT, NVL, rg, W, ring=None):
+ 
+ @nki.jit
+ def step_tp(pos, plen, prompt, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cos, sin,
+-            kcache, vcache, rkb, TB, SL, hw, NQL, NKL, ITL, W, rg, PF=0, HBMCC=0, VCH=1, PFG=-1, CCQ=0, KVS=0, PQP=0, PQA=0, HALF=0, RBQ=0, KVQ=0, PFO=0, SLO=0, DSP=1, CCQM=-1, RBQM=-1, RING=0, RCP=0, BCP=0):
++            kcache, vcache, rkb, TB, SL, hw, NQL, NKL, ITL, W, rg, PF=0, HBMCC=0, VCH=1, PFG=-1, CCQ=0, KVS=0, PQP=0, PQA=0, HALF=0, RBQ=0, KVQ=0, PFO=0, SLO=0, DSP=1, CCQM=-1, RBQM=-1, RING=0, RCP=0, BCP=0, PFN=0, PFE=0):
+     DSPLIT[0] = DSP
+     L = wqkv.shape[0]
+     HT = embed.shape[1] // 128
+@@ -784,7 +812,7 @@ def step_tp(pos, plen, prompt, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd,
+     for l in range(L):
+         h, pre = _layer_tp(h, l, pid, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot_sb, kcache, vcache,
+                            preg, pb, cs_col, sn_col, ones, ident, idf, ones16, TB, SL, hw, HT, NQL, NKL, ITL, rg, W,
+-                           PF, pre, hbuf, vreg, VCH, PFG, CCQ, KVS, qbuf, HALF, RBQ, KVQ, PFO, SLO, CCQM, RBQM, ring, BCP)
++                           PF, pre, hbuf, vreg, VCH, PFG, CCQ, KVS, qbuf, HALF, RBQ, KVQ, PFO, SLO, CCQM, RBQM, ring, BCP, PFN, PFE)
+     wf = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.dma_copy(dst=wf, src=normf)
+     xf = _rms_col(h, wf, HT, HID, ones, nl.bfloat16)
+diff --git a/kernels/targets.py b/kernels/targets.py
+index a043e48..0e45808 100644
+--- a/kernels/targets.py
++++ b/kernels/targets.py
+@@ -196,7 +196,7 @@ def run(t):
+                            PQP=t.get("PQP", 0), PQA=t.get("PQA", 0), HALF=t.get("HALF", 0),
+                            RBQ=t.get("RBQ", 0), KVQ=t.get("KVQ", 0), PFO=t.get("PFO", 0),
+                            SLO=t.get("SLO", 0), DSP=t.get("DSP", 1),
+-                           CCQM=t.get("CCQM", -1), RBQM=t.get("RBQM", -1), RING=t.get("RING", 0), RCP=t.get("RCP", 0), BCP=t.get("BCP", 0))
++                           CCQM=t.get("CCQM", -1), RBQM=t.get("RBQM", -1), RING=t.get("RING", 0), RCP=t.get("RCP", 0), BCP=t.get("BCP", 0), PFN=t.get("PFN", 0), PFE=t.get("PFE", 0))
+     elif t["kind"] == "prefill":
+         import prefill_tp
+         sp = prefill_spec(t["S"], t["STAGE"])
+@@ -215,6 +215,6 @@ def run(t):
+                                  NSP2=t.get("NSP2", 0), PN=t.get("PN", 0), PNA=t.get("PNA", 0), XN=t.get("XN", 0), FN0=t.get("FN0", 0),
+                                  HS=t.get("HS", 0), HSC=t.get("HSC", 1), NCH=t.get("NCH", 1),
+                                  NCQL=t.get("NCQL", 0), NCH2=t.get("NCH2", 0),
+-                                 SP=t.get("SP", 0), SPL=t.get("SPL", -1), SPN=t.get("SPN", 0), SPT=t.get("SPT", 0), SPO=t.get("SPO", 0), SPA=t.get("SPA", 0), SPD=t.get("SPD", 0), SPH=t.get("SPH", 0), SPHN=t.get("SPHN", 0), SPP=t.get("SPP", 0), SPQ=t.get("SPQ", 0), GCH=t.get("GCH", 1), SOC=t.get("SOC", 1), SPS=t.get("SPS", 1), SPG=t.get("SPG", 0), KTP=t.get("KTP", 0), KTQ=t.get("KTQ", 0), MP=t.get("MP", 0))
++                                 SP=t.get("SP", 0), SPL=t.get("SPL", -1), SPN=t.get("SPN", 0), SPT=t.get("SPT", 0), SPO=t.get("SPO", 0), SPA=t.get("SPA", 0), SPD=t.get("SPD", 0), SPH=t.get("SPH", 0), SPHN=t.get("SPHN", 0), SPP=t.get("SPP", 0), SPQ=t.get("SPQ", 0), GCH=t.get("GCH", 1), SOC=t.get("SOC", 1), SPS=t.get("SPS", 1), SPG=t.get("SPG", 0), KTP=t.get("KTP", 0), KTQ=t.get("KTQ", 0), MP=t.get("MP", 0), QPD=t.get("QPD", 0), DR=t.get("DR", 0), DRG=t.get("DRG", 0), WQS=t.get("WQS", 0))
+     else:
+         raise ValueError(t["kind"])
