@@ -10,4 +10,5 @@ Specialized inference engines built with [EngineSmith](https://github.com/Engine
 | [llama8b-round011](llama8b-round011/) | NousResearch/Meta-Llama-3.1-8B-Instruct | trn2.48xlarge | 1.66x nxdi (search evaluation) |
 | [q06-astra-y-round003](q06-astra-y-round003/) | Qwen/Qwen3-0.6B | trn2.48xlarge | 2.30x nxdi (search evaluation) |
 | [q14-lab-round001](q14-lab-round001/) | Qwen/Qwen3-14B | trn2.48xlarge | 1.74x nxdi (search evaluation) |
+| [q30-lab-round002](q30-lab-round002/) | Qwen/Qwen3-30B-A3B | trn2.48xlarge | 2.91x nxdi (search evaluation) |
 
