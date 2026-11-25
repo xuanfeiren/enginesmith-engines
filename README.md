@@ -12,4 +12,5 @@ Specialized inference engines built with [EngineSmith](https://github.com/Engine
 | [q14-lab-round001](q14-lab-round001/) | Qwen/Qwen3-14B | trn2.48xlarge | 1.74x nxdi (search evaluation) |
 | [q30-lab-round002](q30-lab-round002/) | Qwen/Qwen3-30B-A3B | trn2.48xlarge | 2.91x nxdi (search evaluation) |
 | [q32-round011](q32-round011/) | Qwen/Qwen3-32B | trn2.48xlarge | 1.66x nxdi (held-out final) |
+| [q35-2b-v4-round000](q35-2b-v4-round000/) | Qwen/Qwen3.5-2B | trn2.48xlarge | 0.07x the reference (held-out final) |
 
