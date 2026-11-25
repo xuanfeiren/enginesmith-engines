@@ -9,4 +9,5 @@ Specialized inference engines built with [EngineSmith](https://github.com/Engine
 | [gptoss-20b-v4-round005](gptoss-20b-v4-round005/) | openai/gpt-oss-20b | trn2.48xlarge | 0.06x the reference (held-out final) |
 | [llama8b-round011](llama8b-round011/) | NousResearch/Meta-Llama-3.1-8B-Instruct | trn2.48xlarge | 1.66x nxdi (search evaluation) |
 | [q06-astra-y-round003](q06-astra-y-round003/) | Qwen/Qwen3-0.6B | trn2.48xlarge | 2.30x nxdi (search evaluation) |
+| [q14-lab-round001](q14-lab-round001/) | Qwen/Qwen3-14B | trn2.48xlarge | 1.74x nxdi (search evaluation) |
 
